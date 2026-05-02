@@ -2,8 +2,27 @@ require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
 const path = require('path');
-const db = require('./database');
+const admin = require('firebase-admin');
 
+// Initialize Firebase Admin
+if (!admin.apps.length) {
+  try {
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+    } else {
+      admin.initializeApp();
+    }
+  } catch (err) {
+    console.error('Firebase initialization error:', err);
+    // Fallback for local dev if no service account is provided
+    admin.initializeApp();
+  }
+}
+
+const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -16,76 +35,63 @@ app.use(express.json());
 
 // Session for Admin & User Login
 app.use(session({
+  name: '__session', // Required for Firebase Hosting, works on Vercel too
   secret: 'modvault-super-secret-key-123',
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 1000 * 60 * 60 * 24 * 7 } // 1 week
+  cookie: { secure: process.env.NODE_ENV === 'production', maxAge: 1000 * 60 * 60 * 24 * 7 }
 }));
 
-// Global middleware to pass user session to all EJS templates
+// Global middleware
 app.use((req, res, next) => {
   res.locals.user = req.session.user || null;
   res.locals.isAdmin = req.session.isAdmin || false;
   next();
 });
 
-// Admin auth middleware
+// Auth middleware
 const requireAuth = (req, res, next) => {
-  if (req.session.isAdmin) {
-    next();
-  } else {
-    // If it's an API route, send 401
-    if (req.originalUrl.startsWith('/admin/api')) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    // Otherwise redirect to login
-    res.redirect('/admin/login');
-  }
+  if (req.session.isAdmin) next();
+  else res.redirect('/admin/login');
+};
+
+const requireUser = (req, res, next) => {
+  if (req.session.user) next();
+  else res.redirect('/');
+};
+
+// =======================
+// DB HELPERS (Firestore)
+// =======================
+const getAllApks = async () => {
+  const snapshot = await db.collection('apks').get();
+  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+};
+
+const getApkBySlug = async (slug) => {
+  const snapshot = await db.collection('apks').where('slug', '==', slug).limit(1).get();
+  if (snapshot.empty) return null;
+  return { id: snapshot.docs[0].id, ...snapshot.docs[0].data() };
 };
 
 // =======================
 // PUBLIC ROUTES
 // =======================
 
-// Helper function to query DB
-const queryDb = (sql, params = []) => {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
-  });
-};
-
-const getDb = (sql, params = []) => {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) reject(err);
-      else resolve(row);
-    });
-  });
-};
-
 app.get('/', async (req, res) => {
   try {
-    const apks = await queryDb('SELECT * FROM apks ORDER BY downloads DESC LIMIT 10');
+    const apks = await getAllApks();
+    apks.sort((a, b) => (b.downloads || 0) - (a.downloads || 0));
     
-    // Calculate global stats
-    const totalApks = await getDb('SELECT COUNT(*) as count FROM apks');
-    const totalDownloads = await getDb('SELECT SUM(downloads) as total FROM apks');
-    
-    const parsedApks = apks.map(apk => ({
-      ...apk,
-      mod_features: JSON.parse(apk.mod_features || '[]')
-    }));
+    const stats = {
+      apks: apks.length,
+      downloads: apks.reduce((sum, a) => sum + (a.downloads || 0), 0)
+    };
     
     res.render('index', { 
-      apks: parsedApks, 
+      apks: apks.slice(0, 10), 
       currentRoute: 'home',
-      stats: {
-        apks: totalApks.count,
-        downloads: totalDownloads.total || 0
-      }
+      stats
     });
   } catch (err) {
     console.error(err);
@@ -95,8 +101,9 @@ app.get('/', async (req, res) => {
 
 app.get('/games', async (req, res) => {
   try {
-    const apks = await queryDb("SELECT * FROM apks WHERE category = 'games' ORDER BY upload_date DESC");
-    res.render('games', { apks, currentRoute: 'games' });
+    const apks = await getAllApks();
+    const games = apks.filter(a => a.category === 'games').sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
+    res.render('games', { apks: games, currentRoute: 'games' });
   } catch (err) {
     res.status(500).send("Server Error");
   }
@@ -104,8 +111,9 @@ app.get('/games', async (req, res) => {
 
 app.get('/apps', async (req, res) => {
   try {
-    const apks = await queryDb("SELECT * FROM apks WHERE category = 'apps' ORDER BY upload_date DESC");
-    res.render('apps', { apks, currentRoute: 'apps' });
+    const apks = await getAllApks();
+    const apps = apks.filter(a => a.category === 'apps').sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
+    res.render('apps', { apks: apps, currentRoute: 'apps' });
   } catch (err) {
     res.status(500).send("Server Error");
   }
@@ -113,14 +121,11 @@ app.get('/apps', async (req, res) => {
 
 app.get('/app/:slug', async (req, res) => {
   try {
-    const apk = await getDb("SELECT * FROM apks WHERE slug = ?", [req.params.slug]);
+    const apk = await getApkBySlug(req.params.slug);
     if (!apk) return res.status(404).send("App not found");
     
-    apk.mod_features = JSON.parse(apk.mod_features || '[]');
-    apk.how_to_install = JSON.parse(apk.how_to_install || '[]');
-    
-    // Fetch similar apps
-    const similar = await queryDb("SELECT * FROM apks WHERE category = ? AND id != ? LIMIT 3", [apk.category, apk.id]);
+    const apks = await getAllApks();
+    const similar = apks.filter(a => a.category === apk.category && a.id !== apk.id).slice(0, 3);
     
     res.render('app', { apk, similar, currentRoute: 'app' });
   } catch (err) {
@@ -132,25 +137,29 @@ app.get('/app/:slug', async (req, res) => {
 app.get('/search', async (req, res) => {
   const q = req.query.q || '';
   try {
-    const apks = await queryDb("SELECT * FROM apks WHERE name LIKE ?", [`%${q}%`]);
-    res.render('search', { apks, query: q, currentRoute: 'search' });
+    const apks = await getAllApks();
+    const filtered = apks.filter(a => a.name.toLowerCase().includes(q.toLowerCase()));
+    res.render('search', { apks: filtered, query: q, currentRoute: 'search' });
   } catch (err) {
     res.status(500).send("Server Error");
   }
 });
 
 app.get('/categories', (req, res) => res.render('categories', { currentRoute: 'categories' }));
+
 app.get('/latest', async (req, res) => {
   try {
-    const apks = await queryDb("SELECT * FROM apks ORDER BY upload_date DESC");
+    const apks = await getAllApks();
+    apks.sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
     res.render('latest', { apks, currentRoute: 'latest' });
   } catch(err) {
     res.status(500).send("Server Error");
   }
 });
+
 app.get('/download/:slug', async (req, res) => {
   try {
-    const apk = await getDb("SELECT * FROM apks WHERE slug = ?", [req.params.slug]);
+    const apk = await getApkBySlug(req.params.slug);
     if (!apk) return res.status(404).send("App not found");
     res.render('download', { apk, currentRoute: 'download' });
   } catch(err) {
@@ -171,114 +180,39 @@ app.get('/cookies', (req, res) => res.render('cookies', { currentRoute: 'cookies
 // USER AUTH ROUTES
 // =======================
 
-app.post('/api/signup', async (req, res) => {
-  const { name, username, email, password } = req.body;
-  
-  if (!name || !username || !email || !password) {
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
-
-  // Very basic hashing for demo (in production use bcrypt)
-  const encodedPass = Buffer.from(password).toString('base64');
-  const joinDate = new Date().toISOString();
-
-  try {
-    db.run(
-      'INSERT INTO users (name, username, email, password, role, join_date) VALUES (?, ?, ?, ?, ?, ?)',
-      [name, username, email, encodedPass, 'user', joinDate],
-      function (err) {
-        if (err) {
-          if (err.message.includes('UNIQUE')) {
-            return res.status(400).json({ error: 'Username or Email already exists!' });
-          }
-          return res.status(500).json({ error: 'Database error' });
-        }
-        
-        // Auto login
-        const newUser = { id: this.lastID, name, username, email, role: 'user' };
-        req.session.user = newUser;
-        res.json({ success: true, user: newUser });
-      }
-    );
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
-  const encodedPass = Buffer.from(password).toString('base64');
-
-  try {
-    const user = await getDb('SELECT id, name, username, email, role FROM users WHERE (email = ? OR username = ?) AND password = ?', [email, email, encodedPass]);
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid email/username or password' });
-    }
-
-    req.session.user = user;
-    if (user.role === 'admin') {
-      req.session.isAdmin = true;
-    }
-    
-    res.json({ success: true, user });
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 app.post('/api/firebase-auth', async (req, res) => {
   const { uid, email, name, role } = req.body;
-
-  if (!email || !uid) {
-    return res.status(400).json({ error: 'Missing user data' });
-  }
+  if (!email) return res.status(400).json({ error: 'Missing email' });
 
   try {
-    // Check if user exists
-    let user = await getDb('SELECT id, name, username, email, role FROM users WHERE email = ?', [email]);
-
-    if (!user) {
-      // Create user if they don't exist
-      const username = email.split('@')[0] + '_' + uid.slice(0, 5);
-      const joinDate = new Date().toISOString();
-      const encodedPass = Buffer.from(uid).toString('base64');
-
-      await new Promise((resolve, reject) => {
-        db.run(
-          'INSERT INTO users (name, username, email, password, role, join_date) VALUES (?, ?, ?, ?, ?, ?)',
-          [name, username, email, encodedPass, role || 'user', joinDate],
-          function(err) {
-            if (err) reject(err);
-            else resolve(this.lastID);
-          }
-        );
-      }).then(lastID => {
-        user = { id: lastID, name, username, email, role: role || 'user' };
-      });
-    } else if (role && user.role !== role) {
-      // Update role if it changed in Firestore
-      await new Promise((resolve, reject) => {
-        db.run('UPDATE users SET role = ? WHERE id = ?', [role, user.id], (err) => {
-          if (err) reject(err);
-          else resolve();
-        });
-      });
-      user.role = role;
+    const userRef = db.collection('users').doc(email);
+    const doc = await userRef.get();
+    
+    let userData;
+    if (!doc.exists) {
+      userData = {
+        name,
+        email,
+        uid,
+        role: role || 'user',
+        join_date: new Date().toISOString()
+      };
+      await userRef.set(userData);
+    } else {
+      userData = doc.data();
+      if (role && userData.role !== role) {
+        await userRef.update({ role });
+        userData.role = role;
+      }
     }
 
-    req.session.user = user;
-    if (user.role === 'admin') {
-      req.session.isAdmin = true;
-    }
+    req.session.user = userData;
+    if (userData.role === 'admin') req.session.isAdmin = true;
 
-    res.json({ success: true, user });
+    res.json({ success: true, user: userData });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Server error during Firebase sync' });
+    res.status(500).json({ error: 'Server error during auth' });
   }
 });
 
@@ -291,42 +225,31 @@ app.post('/api/logout', (req, res) => {
 // USER PROFILE ROUTES
 // =======================
 
-const requireUser = (req, res, next) => {
-  if (req.session.user) next();
-  else res.redirect('/'); // Or show an error modal
-};
-
 app.get('/profile', requireUser, async (req, res) => {
   try {
-    // Get total download count
-    const stats = await getDb('SELECT COUNT(*) as count FROM user_downloads WHERE user_id = ?', [req.session.user.id]);
+    const email = req.session.user.email;
+    const snap = await db.collection('user_downloads').where('email', '==', email).orderBy('download_date', 'desc').limit(4).get();
+    const downloads = snap.docs.map(doc => doc.data());
     
-    // Get user's download history
-    const downloads = await queryDb(`
-      SELECT apks.*, user_downloads.download_date 
-      FROM user_downloads 
-      JOIN apks ON user_downloads.apk_id = apks.id 
-      WHERE user_downloads.user_id = ? 
-      ORDER BY user_downloads.download_date DESC LIMIT 4
-    `, [req.session.user.id]);
+    // For simplicity, we count directly from user_downloads collection
+    const countSnap = await db.collection('user_downloads').where('email', '==', email).get();
     
-    res.render('profile', { currentRoute: 'profile', downloads, totalDownloads: stats.count });
+    res.render('profile', { 
+      currentRoute: 'profile', 
+      downloads, 
+      totalDownloads: countSnap.size 
+    });
   } catch (err) {
+    console.error(err);
     res.status(500).send('Server Error');
   }
 });
 
 app.get('/downloads', requireUser, async (req, res) => {
   try {
-    // Get all user downloads
-    const downloads = await queryDb(`
-      SELECT apks.*, user_downloads.download_date 
-      FROM user_downloads 
-      JOIN apks ON user_downloads.apk_id = apks.id 
-      WHERE user_downloads.user_id = ? 
-      ORDER BY user_downloads.download_date DESC
-    `, [req.session.user.id]);
-    
+    const email = req.session.user.email;
+    const snap = await db.collection('user_downloads').where('email', '==', email).orderBy('download_date', 'desc').get();
+    const downloads = snap.docs.map(doc => doc.data());
     res.render('downloads', { currentRoute: 'downloads', downloads });
   } catch (err) {
     res.status(500).send('Server Error');
@@ -335,25 +258,38 @@ app.get('/downloads', requireUser, async (req, res) => {
 
 app.post('/api/download/:slug', requireUser, async (req, res) => {
   try {
-    const apk = await getDb("SELECT id FROM apks WHERE slug = ?", [req.params.slug]);
+    const apk = await getApkBySlug(req.params.slug);
     if (!apk) return res.status(404).json({ error: 'APK not found' });
 
-    // Check if already downloaded
-    const existing = await getDb("SELECT id FROM user_downloads WHERE user_id = ? AND apk_id = ?", [req.session.user.id, apk.id]);
-    
-    if (!existing) {
-      const now = new Date().toISOString();
-      db.run("INSERT INTO user_downloads (user_id, apk_id, download_date) VALUES (?, ?, ?)", [req.session.user.id, apk.id, now]);
-      // Also increment global downloads
-      db.run("UPDATE apks SET downloads = downloads + 1 WHERE id = ?", [apk.id]);
+    const email = req.session.user.email;
+    const downloadId = `${email}_${apk.id}`;
+    const downloadRef = db.collection('user_downloads').doc(downloadId);
+    const doc = await downloadRef.get();
+
+    if (!doc.exists) {
+      await downloadRef.set({
+        email,
+        apk_id: apk.id,
+        name: apk.name,
+        icon: apk.icon,
+        icon_bg: apk.icon_bg,
+        slug: apk.slug,
+        download_date: new Date().toISOString()
+      });
+      
+      // Increment global downloads
+      const apkRef = db.collection('apks').doc(apk.id);
+      await apkRef.update({
+        downloads: admin.firestore.FieldValue.increment(1)
+      });
     }
     
     res.json({ success: true });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Server error' });
   }
 });
-
 
 // =======================
 // ADMIN ROUTES
@@ -366,7 +302,7 @@ app.get('/admin/login', (req, res) => {
 
 app.post('/admin/login', (req, res) => {
   const { password } = req.body;
-  if (password === 'admin123') { // Simple password for now
+  if (password === 'admin123') {
     req.session.isAdmin = true;
     res.redirect('/admin');
   } else {
@@ -379,25 +315,25 @@ app.get('/admin/logout', (req, res) => {
   res.redirect('/admin/login');
 });
 
-// Admin Dashboard
 app.get('/admin', requireAuth, async (req, res) => {
   try {
-    const apks = await queryDb('SELECT * FROM apks ORDER BY upload_date DESC');
-    const totalDownloads = apks.reduce((sum, apk) => sum + apk.downloads, 0);
-    const totalGames = apks.filter(a => a.category === 'games').length;
-    const totalApps = apks.filter(a => a.category === 'apps').length;
+    const apks = await getAllApks();
+    apks.sort((a, b) => new Date(b.upload_date) - new Date(a.upload_date));
     
-    res.render('admin', { 
-      apks, 
-      stats: { total: apks.length, downloads: totalDownloads, games: totalGames, apps: totalApps }
-    });
+    const stats = {
+      total: apks.length,
+      downloads: apks.reduce((sum, a) => sum + (a.downloads || 0), 0),
+      games: apks.filter(a => a.category === 'games').length,
+      apps: apks.filter(a => a.category === 'apps').length
+    };
+    
+    res.render('admin', { apks, stats });
   } catch (err) {
     res.status(500).send("Server Error");
   }
 });
 
-// API endpoint to create APK
-app.post('/admin/api/apk', requireAuth, (req, res) => {
+app.post('/admin/api/apk', requireAuth, async (req, res) => {
   const { 
     name, version, category, sub_category, size, android_required, rating, 
     icon, download_url, mod_features, description, how_to_install 
@@ -407,32 +343,31 @@ app.post('/admin/api/apk', requireAuth, (req, res) => {
   const icon_bg = 'linear-gradient(135deg, #6c63ff, #a78bfa)';
   const upload_date = new Date().toISOString().split('T')[0];
 
-  // Store features and install as JSON strings
-  const featuresJson = JSON.stringify(mod_features ? mod_features.split('\n').filter(Boolean) : []);
-  const installJson = JSON.stringify(how_to_install ? how_to_install.split('\n').filter(Boolean) : []);
-
-  db.run(`
-    INSERT INTO apks (
-      name, slug, version, category, sub_category, size, android_required, 
-      rating, icon, icon_bg, download_url, mod_features, description, 
-      how_to_install, upload_date
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, [
+  const newApk = {
     name, slug, version, category, sub_category, size, android_required,
-    parseFloat(rating) || 4.5, icon || '📱', icon_bg, download_url, featuresJson, description,
-    installJson, upload_date
-  ], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true, id: this.lastID, slug });
-  });
+    rating: parseFloat(rating) || 4.5, icon: icon || '📱', icon_bg, download_url,
+    mod_features: mod_features ? mod_features.split('\n').filter(Boolean) : [],
+    description,
+    how_to_install: how_to_install ? how_to_install.split('\n').filter(Boolean) : [],
+    upload_date,
+    downloads: 0
+  };
+
+  try {
+    const docRef = await db.collection('apks').add(newApk);
+    res.json({ success: true, id: docRef.id, slug });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// API endpoint to delete APK
-app.delete('/admin/api/apk/:id', requireAuth, (req, res) => {
-  db.run('DELETE FROM apks WHERE id = ?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ success: true, changes: this.changes });
-  });
+app.delete('/admin/api/apk/:id', requireAuth, async (req, res) => {
+  try {
+    await db.collection('apks').doc(req.params.id).delete();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const DOMAIN = process.env.BASE_URL || `http://localhost:${PORT}`;
